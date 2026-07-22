@@ -134,10 +134,43 @@ td.we-td{background:rgba(251,146,60,.04)}
 .emp-dept{font-size:9px;color:#64748b}
 .emp-desig{font-size:9px;color:#64748b;font-style:italic}
 .emp-doj{font-size:9px;color:#475569}
-.leave-cell{width:26px;height:26px;margin:0 auto;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:800;border:1px solid transparent}
+.leave-cell{width:26px;height:26px;margin:0 auto;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:800;border:1px solid transparent;position:relative;transition:transform .22s cubic-bezier(.34,1.56,.64,1),box-shadow .22s ease,filter .22s ease;transform-style:preserve-3d}
 .leave-cell.clickable{cursor:pointer}
 .leave-cell.we{border-color:rgba(251,146,60,.15);opacity:.5}
 .leave-cell.empty.clickable::after{content:"+";opacity:.2;font-size:7px}
+.leave-cell.clickable:not(.empty):hover{
+  transform:scale(2.35) translateY(-6px);
+  z-index:60;
+  filter:saturate(1.6) brightness(1.18);
+  box-shadow:0 0 0 1px rgba(255,255,255,.5) inset,
+             0 0 14px 3px currentColor,
+             0 0 34px 10px currentColor,
+             0 18px 30px rgba(0,0,0,.55);
+  animation:holo-flicker 1.6s ease-in-out infinite;
+}
+.leave-cell.clickable:not(.empty):hover::before{
+  content:"";
+  position:absolute;
+  inset:-40%;
+  background:repeating-linear-gradient(115deg,rgba(255,255,255,.35) 0px,rgba(255,255,255,.35) 1px,transparent 2px,transparent 5px);
+  mix-blend-mode:overlay;
+  border-radius:5px;
+  animation:holo-scan 1.4s linear infinite;
+  pointer-events:none;
+}
+@keyframes holo-flicker{
+  0%,100%{opacity:1}
+  45%{opacity:1}
+  47%{opacity:.85}
+  49%{opacity:1}
+  72%{opacity:1}
+  74%{opacity:.9}
+  76%{opacity:1}
+}
+@keyframes holo-scan{
+  0%{transform:translateY(-15%)}
+  100%{transform:translateY(15%)}
+}
 
 /* Popup */
 .popup-overlay{position:fixed;inset:0;z-index:200;background:transparent}
@@ -277,6 +310,16 @@ const LEAVE_TYPES = [
   {code:"OTH", label:"Other",              color:"#94a3b8", bg:"#1e293b", text:"#cbd5e1", days:1},
 ];
 const LT = Object.fromEntries(LEAVE_TYPES.map(l => [l.code, l]));
+const LEAVE_STATUSES = [
+  {code:"planned",             label:"Planned",              short:"Planned",  color:"#eab308", bg:"rgba(234,179,8,.22)",   text:"#fef08a"},
+  {code:"pending",             label:"Pending",               short:"Pending",  color:"#f97316", bg:"rgba(249,115,22,.22)",  text:"#fed7aa"},
+  {code:"approved",            label:"Approved",              short:"Approved", color:"#10b981", bg:"rgba(16,185,129,.22)",  text:"#6ee7b7"},
+  {code:"rejected",            label:"Rejected",               short:"Rejected", color:"#ef4444", bg:"rgba(239,68,68,.22)",   text:"#fca5a5"},
+  {code:"cancelled_employee",  label:"Cancelled by Employee",  short:"Cancelled (Emp)", color:"#a78bfa", bg:"rgba(167,139,250,.22)", text:"#ddd6fe"},
+  {code:"cancelled_authority", label:"Cancelled by Authority", short:"Cancelled (Auth)", color:"#38bdf8", bg:"rgba(56,189,248,.22)", text:"#bae6fd"},
+];
+const LS = Object.fromEntries(LEAVE_STATUSES.map(s=>[s.code,s]));
+const REFUND_STATUSES = ["rejected","cancelled_employee","cancelled_authority"];
 const DEFAULT_QUOTA = {CL:10, SL:14, EL:0, COL:0, ML:0, OTH:0};
 const BALANCE_TYPES = LEAVE_TYPES.filter(lt=>lt.code==="CL"||lt.code==="SL");
 const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
@@ -586,6 +629,7 @@ function getMS(empId, y, m){
     const pts = k.split("__")[1].split("-");
     if(parseInt(pts[0])!==y || parseInt(pts[1])!==(m+1)) return;
     const lt = LT[code]; if(!lt) return;
+    if(REFUND_STATUSES.includes(state.leaveStatus[k])) return;
     s.total+=lt.days; s[code]=(s[code]||0)+lt.days;
   });
   return s;
@@ -598,6 +642,7 @@ function getYS(empId, y){
     const yr = parseInt(k.split("__")[1].split("-")[0]);
     if(yr!==y) return;
     const lt = LT[code]; if(!lt) return;
+    if(REFUND_STATUSES.includes(state.leaveStatus[k])) return;
     s.total+=lt.days; s[code]=(s[code]||0)+lt.days;
   });
   return s;
@@ -612,10 +657,11 @@ function getLeaveDates(empId, y, m){
     if(yr !== y) return;
     if(m !== null && mo !== (m+1)) return;
     const lt = LT[code]; if(!lt) return;
-    list.push({yr,mo,day,code});
+    const st = LS[state.leaveStatus[k]] || LS.planned;
+    list.push({yr,mo,day,code,statusShort:st.short});
   });
   list.sort((a,b)=> a.mo-b.mo || a.day-b.day);
-  return list.map(x=> String(x.day).padStart(2,'0')+"-"+String(x.mo).padStart(2,'0')+(m===null?"-"+x.yr:"")+" ("+x.code+")");
+  return list.map(x=> String(x.day).padStart(2,'0')+"-"+String(x.mo).padStart(2,'0')+(m===null?"-"+x.yr:"")+" ("+x.code+" · "+x.statusShort+")");
 }
 function getEmpQuota(empId){
   const custom = state.leaveBalances[empId];
@@ -816,7 +862,7 @@ window.setLeave = function(empId, day, code){
     delete state.leaveStatus[key];
   } else {
     state.leaves[key]=code;
-    if(!state.leaveStatus[key]) state.leaveStatus[key]="pending";
+    if(!state.leaveStatus[key]) state.leaveStatus[key]="planned";
   }
   state.editCell=null;
   debounceSave(); render(); showToast("Saved ✓");
@@ -826,7 +872,9 @@ window.setLeaveStatus = function(empId, day, status){
   const key=lk(empId,state.year,state.month,day);
   if(!state.leaves[key]) return;
   state.leaveStatus[key]=status;
-  debounceSave(); render(); showToast(status==="approved"?"Approved ✓":status==="rejected"?"Rejected ✕":"Marked Pending");
+  debounceSave(); render();
+  const st = LS[status];
+  showToast(st ? st.short+" ✓" : "Status updated");
 };
 window.removeLeave = function(empId, day){
   const key=lk(empId,state.year,state.month,day);
@@ -1001,7 +1049,29 @@ function render(){
   const savedScrollTop = twBefore ? twBefore.scrollTop : 0;
   const savedScrollLeft = twBefore ? twBefore.scrollLeft : 0;
 
-  if(!state.currentUser){ app.innerHTML=renderLogin(); return; }
+  // Save login form fields (username/password) before render, in case a background sync re-renders while typing
+  const luEl = document.getElementById('lu');
+  const lpEl = document.getElementById('lp');
+  const luVal = luEl ? luEl.value : null;
+  const lpVal = lpEl ? lpEl.value : null;
+  const luFocused = luEl && document.activeElement === luEl;
+  const lpFocused = lpEl && document.activeElement === lpEl;
+  const luStart = luEl ? luEl.selectionStart : null;
+  const luEnd = luEl ? luEl.selectionEnd : null;
+  const lpStart = lpEl ? lpEl.selectionStart : null;
+  const lpEnd = lpEl ? lpEl.selectionEnd : null;
+
+  if(!state.currentUser){
+    app.innerHTML=renderLogin();
+    // Restore whatever was typed and refocus, so a background sync doesn't wipe the login form
+    const newLu = document.getElementById('lu');
+    const newLp = document.getElementById('lp');
+    if(newLu && luVal){ newLu.value = luVal; }
+    if(newLp && lpVal){ newLp.value = lpVal; }
+    if(luFocused && newLu){ newLu.focus(); try{ newLu.setSelectionRange(luStart, luEnd); }catch(e){} }
+    else if(lpFocused && newLp){ newLp.focus(); try{ newLp.setSelectionRange(lpStart, lpEnd); }catch(e){} }
+    return;
+  }
   app.innerHTML=renderApp();
 
   // Restore search focus and cursor position after render
@@ -1153,23 +1223,23 @@ ${(()=>{
   if(!emp) return "";
   const key = lk(empId, state.year, state.month, day);
   const code = state.leaves[key];
-  const status = state.leaveStatus[key] || "pending";
-  const statusOpts = [
-    {v:"pending",  l:"⏳ Pending",  c:"#f59e0b", bg:"rgba(245,158,11,.12)"},
-    {v:"approved", l:"✅ Approved", c:"#10b981", bg:"rgba(16,185,129,.12)"},
-    {v:"rejected", l:"❌ Rejected", c:"#f87171", bg:"rgba(248,113,113,.12)"},
-  ];
+  const status = state.leaveStatus[key] || "planned";
+  const curSt = LS[status];
   return `
 <div style="position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;padding:20px" onclick="closePopup()">
-  <div id="leave-modal" style="background:#0d1b2e;border:1px solid #1e3a5c;border-radius:14px;padding:14px;width:100%;max-width:220px;box-shadow:0 12px 40px rgba(0,0,0,.9)" onclick="event.stopPropagation()">
+  <div id="leave-modal" style="background:#0d1b2e;border:1px solid #1e3a5c;border-radius:14px;padding:14px;width:100%;max-width:240px;box-shadow:0 12px 40px rgba(0,0,0,.9)" onclick="event.stopPropagation()">
     <div style="font-size:10px;color:#64748b;margin-bottom:8px;font-weight:700">${emp.name.split(" ")[0]} — ${MONTHS[state.month].slice(0,3)} ${day}</div>
     ${LEAVE_TYPES.map(lt2=>`<button class="popup-btn" style="background:${code===lt2.code?lt2.color:lt2.bg};color:${code===lt2.code?'#fff':lt2.text};border-color:${lt2.color}50" onclick="setLeave('${empId}',${day},'${lt2.code}')"><span style="background:${lt2.color};color:#fff;border-radius:3px;padding:0 4px;margin-right:4px;font-size:9px">${lt2.code}</span>${lt2.label}</button>`).join("")}
     ${code?`
     <div style="margin-top:10px;padding-top:10px;border-top:1px solid #1a2d45">
-      <div style="font-size:9px;color:#64748b;font-weight:700;margin-bottom:6px">STATUS</div>
-      <div style="display:flex;gap:5px">
-        ${statusOpts.map(s=>`<button onclick="setLeaveStatus('${empId}',${day},'${s.v}')" style="flex:1;background:${status===s.v?s.c:s.bg};color:${status===s.v?'#fff':s.c};border:1px solid ${s.c}50;border-radius:6px;padding:6px 2px;font-size:9px;font-weight:700;cursor:pointer">${s.l}</button>`).join("")}
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+        <div style="font-size:9px;color:#64748b;font-weight:700">STATUS</div>
+        <div style="font-size:10px;font-weight:800;color:${curSt.color}">${curSt.short}</div>
       </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px">
+        ${LEAVE_STATUSES.map(s=>`<button onclick="setLeaveStatus('${empId}',${day},'${s.code}')" style="background:${status===s.code?s.color:s.bg};color:${status===s.code?'#fff':s.color};border:1px solid ${s.color}60;border-radius:6px;padding:6px 3px;font-size:9px;font-weight:700;cursor:pointer;text-align:center">${s.short}</button>`).join("")}
+      </div>
+      ${REFUND_STATUSES.includes(status)?`<div style="font-size:9px;color:#94a3b8;margin-top:6px;text-align:center">↺ Balance refunded automatically</div>`:""}
     </div>
     <button class="popup-remove" onclick="removeLeave('${empId}',${day})">✕ Remove Leave</button>`:""}
     <button class="popup-cancel" onclick="closePopup()">Cancel</button>
@@ -1260,6 +1330,9 @@ function renderCalendar(calEmps,days,calPages,filtered,ce){
 <div class="legend">
   ${LEAVE_TYPES.map(lt=>`<div class="legend-item" style="background:${lt.bg};color:${lt.text};border:1px solid ${lt.color}40"><span class="legend-code" style="background:${lt.color}">${lt.code}</span>${lt.label}</div>`).join("")}
 </div>
+<div class="legend" style="margin-top:6px">
+  ${LEAVE_STATUSES.map(s=>`<div class="legend-item" style="background:${s.bg};color:${s.text};border:1px solid ${s.color}40"><span class="legend-code" style="background:${s.color}">●</span>${s.short}</div>`).join("")}
+</div>
 ${calPages>1?`
 <div class="pagination">
   <span class="page-info">Page ${state.calPage+1}/${calPages}</span>
@@ -1296,17 +1369,17 @@ ${calPages>1?`
           ${days.map(day=>{
             const key=lk(emp.id,state.year,state.month,day);
             const code=state.leaves[key]; const lt=code?LT[code]:null;
-            const lstatus=state.leaveStatus[key]||"pending";
-            const statusColor=lstatus==="approved"?"#10b981":lstatus==="rejected"?"#f87171":"#f59e0b";
+            const lstatus=state.leaveStatus[key]||"planned";
+            const st=LS[lstatus]||LS.planned;
             const we=isWE(state.year,state.month,day);
             const isEd=state.editCell&&state.editCell.empId===emp.id&&state.editCell.day===day;
             return (
               `<td class="${we?"we-td":""}">
               <div class="leave-cell ${ce?'clickable':''} ${we?'we':''} ${lt?'':'empty'}" 
-                style="${lt?`background:${lt.bg};color:${lt.text};border-color:${lt.color}50;position:relative`:'border-color:transparent'}"
-                onclick="${ce?`openCell('${emp.id}',${day})`:''}">
+                style="${lt?`background:${st.bg};color:${st.text};border-color:${st.color}70;position:relative;box-shadow:inset 0 0 0 1px ${st.color}40`:'border-color:transparent'}"
+                onclick="${ce?`openCell('${emp.id}',${day})`:''}"
+                title="${lt?code+' — '+st.label:''}">
                 ${lt?lt.code:""}
-                ${lt?`<span style="position:absolute;top:-2px;right:-2px;width:7px;height:7px;border-radius:50%;background:${statusColor};border:1px solid #0a1628"></span>`:""}
               </div>
             </td>`
             );
