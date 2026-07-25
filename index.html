@@ -329,6 +329,21 @@ function getDIM(y,m){ return new Date(y,m+1,0).getDate(); }
 function getDOW(y,m,d){ return new Date(y,m,d).getDay(); }
 function isWE(y,m,d){ const w=getDOW(y,m,d); return w===5||w===6; }
 function lk(id,y,m,d){ return id+"__"+y+"-"+(m+1)+"-"+d; }
+const LOG_RETENTION_DAYS = 90;
+const LOG_HARD_CAP = 5000;
+function logActivity(type, empId, empName, details){
+  const entry = {
+    id: Date.now()+"_"+Math.random().toString(36).slice(2,7),
+    ts: Date.now(),
+    user: (state.currentUser && (state.currentUser.displayName||state.currentUser.username)) || "Unknown",
+    type, empId, empName,
+    details,
+    undone: false,
+  };
+  const cutoff = Date.now() - LOG_RETENTION_DAYS*24*60*60*1000;
+  state.activityLog = [entry, ...state.activityLog].filter(e=>e.ts>=cutoff).slice(0, LOG_HARD_CAP);
+  return entry.id;
+}
 
 // ═══════════════════════════════════════════════════════
 //  STATE
@@ -340,6 +355,7 @@ let state = {
   ],
   leaves: {},
   leaveStatus: {},
+  activityLog: [],
   leaveBalances: BASE_LEAVE_BALANCES,
   balanceOpenId: null,
   employees: [...EMPLOYEES],
@@ -458,6 +474,7 @@ function debounceSave(){
       hdr: state.hdr,
       leaveBalances: state.leaveBalances,
       leaveStatus: state.leaveStatus,
+      activityLog: state.activityLog,
       empVersion: EMP_DATA_VERSION,
     };
     // Always save employees separately (large data)
@@ -471,6 +488,7 @@ function debounceSave(){
       localStorage.setItem(SK+"_emps", JSON.stringify(state.employees));
       localStorage.setItem(SK+"_bal", JSON.stringify(state.leaveBalances));
       localStorage.setItem(SK+"_status", JSON.stringify(state.leaveStatus));
+      localStorage.setItem(SK+"_log", JSON.stringify(state.activityLog));
     }catch(e){}
 
     // Firebase save
@@ -502,10 +520,16 @@ function loadState(){
     const emps   = localStorage.getItem(SK+"_emps");
     const bal    = localStorage.getItem(SK+"_bal");
     const status = localStorage.getItem(SK+"_status");
+    const log    = localStorage.getItem(SK+"_log");
     if(leaves) state.leaves = JSON.parse(leaves);
     if(hdr)    state.hdr    = JSON.parse(hdr);
     if(bal)    state.leaveBalances = {...state.leaveBalances, ...JSON.parse(bal)};
     if(status) state.leaveStatus = {...state.leaveStatus, ...JSON.parse(status)};
+    if(log)    state.activityLog = JSON.parse(log);
+    {
+      const cutoff = Date.now() - LOG_RETENTION_DAYS*24*60*60*1000;
+      state.activityLog = (state.activityLog||[]).filter(e=>e.ts>=cutoff).slice(0, LOG_HARD_CAP);
+    }
     if(emps){
       const e = JSON.parse(emps);
       if(Array.isArray(e) && e.length > 0) state.employees = e;
@@ -545,6 +569,11 @@ async function loadFromFirebase(){
       if(d.hdr)    state.hdr    = d.hdr;
       if(d.leaveBalances) state.leaveBalances = {...state.leaveBalances, ...d.leaveBalances};
       if(d.leaveStatus) state.leaveStatus = {...state.leaveStatus, ...d.leaveStatus};
+      if(d.activityLog) state.activityLog = d.activityLog;
+      {
+        const cutoff = Date.now() - LOG_RETENTION_DAYS*24*60*60*1000;
+        state.activityLog = (state.activityLog||[]).filter(e=>e.ts>=cutoff).slice(0, LOG_HARD_CAP);
+      }
       if(d.empVersion) fbEmpVer = d.empVersion;
       if(d.users && d.users.length > 0){
         const hasAdmin = d.users.find(u => u.username==="admin");
@@ -581,6 +610,7 @@ async function loadFromFirebase(){
     localStorage.setItem(SK+"_emps",   JSON.stringify(state.employees));
     localStorage.setItem(SK+"_bal",    JSON.stringify(state.leaveBalances));
     localStorage.setItem(SK+"_status", JSON.stringify(state.leaveStatus));
+    localStorage.setItem(SK+"_log",    JSON.stringify(state.activityLog));
 
     state.syncSt = "synced";
     state.lastSync = new Date().toLocaleTimeString();
@@ -857,12 +887,17 @@ window.closePopup = function(){ state.editCell=null; render(); };
 window.setLeave = function(empId, day, code){
   if(!canEdit()) return;
   const key=lk(empId,state.year,state.month,day);
+  const emp = findEmpById(empId);
+  const prevCode = state.leaves[key] || null;
+  const prevStatus = state.leaveStatus[key] || null;
   if(state.leaves[key]===code){
     delete state.leaves[key];
     delete state.leaveStatus[key];
+    logActivity("leave_remove", empId, emp?emp.name:empId, {day,month:state.month,year:state.year,prevCode,prevStatus});
   } else {
     state.leaves[key]=code;
     if(!state.leaveStatus[key]) state.leaveStatus[key]="planned";
+    logActivity("leave_set", empId, emp?emp.name:empId, {day,month:state.month,year:state.year,prevCode,prevStatus,newCode:code,newStatus:state.leaveStatus[key]});
   }
   state.editCell=null;
   debounceSave(); render(); showToast("Saved ✓");
@@ -871,15 +906,22 @@ window.setLeaveStatus = function(empId, day, status){
   if(!canEdit()) return;
   const key=lk(empId,state.year,state.month,day);
   if(!state.leaves[key]) return;
+  const emp = findEmpById(empId);
+  const prevStatus = state.leaveStatus[key] || null;
   state.leaveStatus[key]=status;
+  logActivity("status_change", empId, emp?emp.name:empId, {day,month:state.month,year:state.year,code:state.leaves[key],prevStatus,newStatus:status});
   debounceSave(); render();
   const st = LS[status];
   showToast(st ? st.short+" ✓" : "Status updated");
 };
 window.removeLeave = function(empId, day){
   const key=lk(empId,state.year,state.month,day);
+  const emp = findEmpById(empId);
+  const prevCode = state.leaves[key] || null;
+  const prevStatus = state.leaveStatus[key] || null;
   delete state.leaves[key];
   delete state.leaveStatus[key];
+  if(prevCode) logActivity("leave_remove", empId, emp?emp.name:empId, {day,month:state.month,year:state.year,prevCode,prevStatus});
   state.editCell=null;
   debounceSave(); render(); showToast("Removed");
 };
@@ -997,8 +1039,11 @@ window.updateRemainingBalance = function(empId, code, val){
   const used = getYS(empId, state.year)[code] || 0;
   const newQuota = newRemaining + used;
   const current = getEmpQuota(empId);
+  const prevQuota = current[code];
   const updated = {...current, [code]: newQuota};
   state.leaveBalances = {...state.leaveBalances, [empId]: updated};
+  const emp = findEmpById(empId);
+  logActivity("balance_change", empId, emp?emp.name:empId, {code, prevQuota, newQuota});
   debounceSave(); render();
 };
 window.toggleBalance = function(empId){
@@ -1008,8 +1053,12 @@ window.toggleBalance = function(empId){
 window.updateBalance = function(empId, code, val){
   const num = val===""?0:parseInt(val,10);
   const current = getEmpQuota(empId);
-  const updated = {...current, [code]: isNaN(num)?0:num};
+  const prevQuota = current[code];
+  const newQuota = isNaN(num)?0:num;
+  const updated = {...current, [code]: newQuota};
   state.leaveBalances = {...state.leaveBalances, [empId]: updated};
+  const emp = findEmpById(empId);
+  logActivity("balance_change", empId, emp?emp.name:empId, {code, prevQuota, newQuota});
   debounceSave(); render();
 };
 window.resetBalance = function(empId){
@@ -1017,6 +1066,30 @@ window.resetBalance = function(empId){
   delete nb[empId];
   state.leaveBalances = nb;
   debounceSave(); render(); showToast("Balance reset to default");
+};
+window.undoActivity = function(logId){
+  const entry = state.activityLog.find(e=>e.id===logId);
+  if(!entry || entry.undone) return;
+  const d = entry.details;
+  if(entry.type === "leave_set"){
+    const key = lk(entry.empId, d.year, d.month, d.day);
+    if(d.prevCode){ state.leaves[key]=d.prevCode; state.leaveStatus[key]=d.prevStatus; }
+    else { delete state.leaves[key]; delete state.leaveStatus[key]; }
+  } else if(entry.type === "leave_remove"){
+    const key = lk(entry.empId, d.year, d.month, d.day);
+    state.leaves[key] = d.prevCode;
+    if(d.prevStatus) state.leaveStatus[key] = d.prevStatus;
+  } else if(entry.type === "status_change"){
+    const key = lk(entry.empId, d.year, d.month, d.day);
+    if(state.leaves[key]) state.leaveStatus[key] = d.prevStatus;
+  } else if(entry.type === "balance_change"){
+    const current = getEmpQuota(entry.empId);
+    const updated = {...current, [d.code]: d.prevQuota};
+    state.leaveBalances = {...state.leaveBalances, [entry.empId]: updated};
+  }
+  entry.undone = true;
+  state.activityLog = [...state.activityLog];
+  debounceSave(); render(); showToast("Undo করা হয়েছে ✓ — আগের অবস্থায় ফিরে গেছে");
 };
 
 // ═══════════════════════════════════════════════════════
@@ -1592,12 +1665,13 @@ function renderSettings(){
   <div style="font-size:11px;color:#64748b;margin-top:3px">All changes saved locally and persist across sessions.</div>
 </div>
 <div class="stab">
-  ${[["users","👤 Users"],["company","🏭 Company"],["import","📥 Import"],["balance","🎯 Balance"],["data","📊 Data"]].map(([t,l])=>`<button class="stab-btn ${state.stab===t?"active":""}" onclick="setStab('${t}')">${l}</button>`).join("")}
+  ${[["users","👤 Users"],["company","🏭 Company"],["import","📥 Import"],["balance","🎯 Balance"],["log","📜 Log"],["data","📊 Data"]].map(([t,l])=>`<button class="stab-btn ${state.stab===t?"active":""}" onclick="setStab('${t}')">${l}</button>`).join("")}
 </div>
 ${state.stab==="users"?renderUserSettings():""}
 ${state.stab==="company"?renderCompanySettings():""}
 ${state.stab==="import"?renderImportSettings():""}
 ${state.stab==="balance"?renderBalanceSettings():""}
+${state.stab==="log"?renderActivityLog():""}
 ${state.stab==="data"?renderDataSettings():""}`;
 }
 
@@ -1680,6 +1754,57 @@ ${state.pasteRows.length>0?`
 </div>`;
 }
 
+function fmtLogTime(ts){
+  const d = new Date(ts);
+  return d.toLocaleDateString('en-GB',{day:'2-digit',month:'short'}) + " " + d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});
+}
+function describeLogEntry(e){
+  const d = e.details;
+  const mon = MONTHS[d.month] ? MONTHS[d.month].slice(0,3) : "";
+  const dateStr = d.day ? (d.day+" "+mon+" "+d.year) : "";
+  if(e.type==="leave_set"){
+    return `<b>${e.empName}</b> — এর ${dateStr}-এ leave <b style="color:${LT[d.newCode]?.color||'#38bdf8'}">${d.newCode}</b> বসানো হয়েছে${d.prevCode?` (আগে ছিল ${d.prevCode})`:""}`;
+  }
+  if(e.type==="leave_remove"){
+    return `<b>${e.empName}</b> — এর ${dateStr}-এর <b style="color:${LT[d.prevCode]?.color||'#f87171'}">${d.prevCode}</b> leave মুছে ফেলা হয়েছে`;
+  }
+  if(e.type==="status_change"){
+    const from = LS[d.prevStatus]?.short||d.prevStatus, to = LS[d.newStatus]?.short||d.newStatus;
+    return `<b>${e.empName}</b> — এর ${dateStr} (${d.code})-এর status <b>${from}</b> থেকে <b>${to}</b> করা হয়েছে`;
+  }
+  if(e.type==="balance_change"){
+    return `<b>${e.empName}</b> — এর <b>${d.code}</b> balance ${d.prevQuota} থেকে ${d.newQuota} করা হয়েছে`;
+  }
+  return "Unknown action";
+}
+function renderActivityLog(){
+  const log = state.activityLog || [];
+  if(!log.length){
+    return `<div class="card" style="text-align:center;padding:30px 16px;color:#64748b">
+      <div style="font-size:28px;margin-bottom:8px">📜</div>
+      <div style="font-size:13px;font-weight:700;color:#94a3b8">এখনো কোনো অ্যাক্টিভিটি রেকর্ড হয়নি</div>
+      <div style="font-size:11px;margin-top:4px">কেউ leave বসালে, status বদলালে, বা balance পরিবর্তন করলে এখানে দেখাবে</div>
+    </div>`;
+  }
+  return `
+<div class="card" style="margin-bottom:12px;background:rgba(56,189,248,.04);border:1px solid rgba(56,189,248,.15)">
+  <div style="font-size:11px;color:#64748b;line-height:1.7">
+    📜 কে, কবে, কী পরিবর্তন করেছে — সব এখানে দেখা যাবে<br>
+    ↩️ ভুল হলে সেই নির্দিষ্ট পরিবর্তনটা <b style="color:#38bdf8">Undo</b> বাটনে চেপে আগের অবস্থায় ফিরিয়ে আনা যাবে<br>
+    🗓️ প্রতিটা এন্ট্রি সর্বোচ্চ <b style="color:#38bdf8">৯০ দিন</b> পর্যন্ত সংরক্ষিত থাকবে, এরপর নিজে থেকেই মুছে যাবে
+  </div>
+</div>
+${log.map(e=>`
+<div class="card" style="margin-bottom:8px;padding:12px 14px;${e.undone?'opacity:.45':''}">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px">
+    <div style="flex:1;font-size:12px;color:#e2e8f0;line-height:1.5">${describeLogEntry(e)}</div>
+    ${e.undone
+      ? `<span style="font-size:9px;color:#64748b;font-weight:700;white-space:nowrap;padding:4px 8px;background:rgba(100,116,139,.15);border-radius:6px">✓ Undone</span>`
+      : `<button onclick="undoActivity('${e.id}')" style="white-space:nowrap;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.3);color:#38bdf8;border-radius:7px;padding:5px 10px;font-size:10px;font-weight:700;cursor:pointer">↩ Undo</button>`}
+  </div>
+  <div style="font-size:9px;color:#475569;margin-top:6px">👤 ${e.user} &middot; 🕒 ${fmtLogTime(e.ts)}</div>
+</div>`).join("")}`;
+}
 function renderBalanceSettings(){
   const rows = state.balPasteRows||[];
   const matched = rows.filter(r=>findEmpById(r.id));
