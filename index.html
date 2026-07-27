@@ -360,6 +360,7 @@ let state = {
   leaveStatus: {},
   activityLog: [],
   leaveBalances: BASE_LEAVE_BALANCES,
+  balanceSnapshots: [],
   balanceOpenId: null,
   employees: [...EMPLOYEES],
   hdr: {
@@ -395,6 +396,7 @@ let state = {
   empPasteRows: [],
   balPasteText: "",
   balPasteRows: [],
+  balImportEffectiveFrom: toLocalDateStr(new Date()),
   showInstall: false,
   deferredPrompt: null,
 };
@@ -480,6 +482,7 @@ function debounceSave(){
       leaveBalances: state.leaveBalances,
       leaveStatus: state.leaveStatus,
       activityLog: state.activityLog,
+      balanceSnapshots: state.balanceSnapshots,
       empVersion: EMP_DATA_VERSION,
     };
     // Always save employees separately (large data)
@@ -494,6 +497,7 @@ function debounceSave(){
       localStorage.setItem(SK+"_bal", JSON.stringify(state.leaveBalances));
       localStorage.setItem(SK+"_status", JSON.stringify(state.leaveStatus));
       localStorage.setItem(SK+"_log", JSON.stringify(state.activityLog));
+      localStorage.setItem(SK+"_snaps", JSON.stringify(state.balanceSnapshots));
     }catch(e){}
 
     // Firebase save
@@ -526,11 +530,13 @@ function loadState(){
     const bal    = localStorage.getItem(SK+"_bal");
     const status = localStorage.getItem(SK+"_status");
     const log    = localStorage.getItem(SK+"_log");
+    const snaps  = localStorage.getItem(SK+"_snaps");
     if(leaves) state.leaves = JSON.parse(leaves);
     if(hdr)    state.hdr    = JSON.parse(hdr);
     if(bal)    state.leaveBalances = {...state.leaveBalances, ...JSON.parse(bal)};
     if(status) state.leaveStatus = {...state.leaveStatus, ...JSON.parse(status)};
     if(log)    state.activityLog = JSON.parse(log);
+    if(snaps)  state.balanceSnapshots = JSON.parse(snaps);
     {
       const cutoff = Date.now() - LOG_RETENTION_DAYS*24*60*60*1000;
       state.activityLog = (state.activityLog||[]).filter(e=>e.ts>=cutoff).slice(0, LOG_HARD_CAP);
@@ -575,6 +581,7 @@ async function loadFromFirebase(){
       if(d.leaveBalances) state.leaveBalances = {...state.leaveBalances, ...d.leaveBalances};
       if(d.leaveStatus) state.leaveStatus = {...state.leaveStatus, ...d.leaveStatus};
       if(d.activityLog) state.activityLog = d.activityLog;
+      if(d.balanceSnapshots) state.balanceSnapshots = d.balanceSnapshots;
       {
         const cutoff = Date.now() - LOG_RETENTION_DAYS*24*60*60*1000;
         state.activityLog = (state.activityLog||[]).filter(e=>e.ts>=cutoff).slice(0, LOG_HARD_CAP);
@@ -616,6 +623,7 @@ async function loadFromFirebase(){
     localStorage.setItem(SK+"_bal",    JSON.stringify(state.leaveBalances));
     localStorage.setItem(SK+"_status", JSON.stringify(state.leaveStatus));
     localStorage.setItem(SK+"_log",    JSON.stringify(state.activityLog));
+    localStorage.setItem(SK+"_snaps",  JSON.stringify(state.balanceSnapshots));
 
     state.syncSt = "synced";
     state.lastSync = new Date().toLocaleTimeString();
@@ -754,6 +762,56 @@ function getLeaveDates(empId, y, m){
 function getEmpQuota(empId){
   const custom = state.leaveBalances[empId];
   return {...DEFAULT_QUOTA, ...(custom||{})};
+}
+// Sorted snapshots (oldest first)
+function sortedSnapshots(){
+  return [...(state.balanceSnapshots||[])].sort((a,b)=> a.effectiveFrom<b.effectiveFrom?-1:a.effectiveFrom>b.effectiveFrom?1:0);
+}
+// Find the snapshot that applies to a given date (the latest one whose effectiveFrom <= dateStr)
+function getActiveSnapshot(dateStr){
+  const snaps = sortedSnapshots();
+  let active = null;
+  for(const s of snaps){
+    if(s.effectiveFrom <= dateStr) active = s;
+    else break;
+  }
+  return active;
+}
+// Quota (from the applicable payroll "slot") for an employee on a given date
+function getEmpQuotaForDate(empId, dateStr){
+  const snap = getActiveSnapshot(dateStr);
+  if(!snap) return getEmpQuota(empId); // legacy fallback — no slots imported yet
+  const custom = snap.balances[empId];
+  return {...DEFAULT_QUOTA, ...(custom||{})};
+}
+// Start/end date-range (as Date objects) of the "slot" containing dateStr
+function getPeriodWindow(dateStr){
+  const snaps = sortedSnapshots();
+  let start = new Date(2000,0,1);
+  let end = new Date(2100,0,1);
+  for(let i=0;i<snaps.length;i++){
+    if(snaps[i].effectiveFrom <= dateStr){
+      start = new Date(snaps[i].effectiveFrom+"T00:00:00");
+      if(snaps[i+1]) end = new Date(new Date(snaps[i+1].effectiveFrom+"T00:00:00").getTime()-86400000);
+    }
+  }
+  return {start,end};
+}
+// Remaining balance for an employee, for whichever "slot" contains the given date
+function getRemainingForDate(empId, dateStr){
+  const quota = getEmpQuotaForDate(empId, dateStr);
+  const {start,end} = getPeriodWindow(dateStr);
+  const used = getWS(empId, start, end);
+  const out = {};
+  Object.keys(quota).forEach(code=>{ out[code] = (quota[code]||0) - (used[code]||0); });
+  return out;
+}
+// Which reference date to use for the Calendar page's CL/SL columns (today if viewing the current month, else the last day of the viewed month — so browsing back shows that month's historical balance)
+function getCalendarRefDate(){
+  const today = new Date();
+  if(state.year===today.getFullYear() && state.month===today.getMonth()) return toLocalDateStr(today);
+  const lastDay = new Date(state.year, state.month+1, 0);
+  return toLocalDateStr(lastDay);
 }
 function getEmpRemaining(empId, y){
   const quota = getEmpQuota(empId);
@@ -1091,15 +1149,35 @@ window.closeInstall = function(){ state.showInstall=false; render(); };
 window.updateNewEmpField = function(f,v){ state.newEmp={...state.newEmp,[f]:v}; };
 window.updateNewUserField = function(f,v){ state.newUser={...state.newUser,[f]:v}; };
 window.toggleAddEmp = function(){ state.showAddEmp=!state.showAddEmp; render(); };
+function setActiveSlotBalance(empId, code, newQuota){
+  const todayStr = toLocalDateStr(new Date());
+  const snaps = sortedSnapshots();
+  const activeSnap = getActiveSnapshot(todayStr);
+  if(activeSnap){
+    // Find it by id in the real (unsorted) array and mutate in place
+    const idx = state.balanceSnapshots.findIndex(s=>s.id===activeSnap.id);
+    if(idx>=0){
+      const cur = state.balanceSnapshots[idx].balances[empId] || {...DEFAULT_QUOTA};
+      state.balanceSnapshots = state.balanceSnapshots.map((s,i)=> i===idx
+        ? {...s, balances:{...s.balances, [empId]:{...cur, [code]:newQuota}}}
+        : s);
+      return;
+    }
+  }
+  // No slots imported yet — legacy path
+  const current = getEmpQuota(empId);
+  state.leaveBalances = {...state.leaveBalances, [empId]: {...current, [code]: newQuota}};
+}
 window.updateRemainingBalance = function(empId, code, val){
   const num = val===""?0:parseInt(val,10);
   const newRemaining = isNaN(num)?0:num;
-  const used = getYS(empId, state.year)[code] || 0;
-  const newQuota = newRemaining + used;
-  const current = getEmpQuota(empId);
+  const todayStr = toLocalDateStr(new Date());
+  const {start,end} = getPeriodWindow(todayStr);
+  const used = getWS(empId, start, end)[code] || 0;
+  const current = getEmpQuotaForDate(empId, todayStr);
   const prevQuota = current[code];
-  const updated = {...current, [code]: newQuota};
-  state.leaveBalances = {...state.leaveBalances, [empId]: updated};
+  const newQuota = newRemaining + used;
+  setActiveSlotBalance(empId, code, newQuota);
   const emp = findEmpById(empId);
   logActivity("balance_change", empId, emp?emp.name:empId, {code, prevQuota, newQuota});
   debounceSave(); render();
@@ -1110,11 +1188,11 @@ window.toggleBalance = function(empId){
 };
 window.updateBalance = function(empId, code, val){
   const num = val===""?0:parseInt(val,10);
-  const current = getEmpQuota(empId);
+  const todayStr = toLocalDateStr(new Date());
+  const current = getEmpQuotaForDate(empId, todayStr);
   const prevQuota = current[code];
   const newQuota = isNaN(num)?0:num;
-  const updated = {...current, [code]: newQuota};
-  state.leaveBalances = {...state.leaveBalances, [empId]: updated};
+  setActiveSlotBalance(empId, code, newQuota);
   const emp = findEmpById(empId);
   logActivity("balance_change", empId, emp?emp.name:empId, {code, prevQuota, newQuota});
   debounceSave(); render();
@@ -1123,6 +1201,16 @@ window.resetBalance = function(empId){
   const nb = {...state.leaveBalances};
   delete nb[empId];
   state.leaveBalances = nb;
+  const todayStr = toLocalDateStr(new Date());
+  const activeSnap = getActiveSnapshot(todayStr);
+  if(activeSnap){
+    const idx = state.balanceSnapshots.findIndex(s=>s.id===activeSnap.id);
+    if(idx>=0){
+      const balances = {...state.balanceSnapshots[idx].balances};
+      delete balances[empId];
+      state.balanceSnapshots = state.balanceSnapshots.map((s,i)=> i===idx ? {...s, balances} : s);
+    }
+  }
   debounceSave(); render(); showToast("Balance reset to default");
 };
 window.undoActivity = function(logId){
@@ -1464,7 +1552,8 @@ function renderView(calEmps,empEmps,days,calPages,empPages,filtered,depts,sa,ce)
 
 function renderCalendar(calEmps,days,calPages,filtered,ce){
   if(filtered.length===0) return `<div class="no-data"><div class="icon">🔍</div><div class="title">No employees found</div><div class="desc">Try a different search or department filter.</div></div>`;
-  
+  const todayD = new Date();
+  const isCurMonth = state.year===todayD.getFullYear() && state.month===todayD.getMonth();
   return `
 <div class="legend">
   ${LEAVE_TYPES.map(lt=>`<div class="legend-item" style="background:${lt.bg};color:${lt.text};border:1px solid ${lt.color}40"><span class="legend-code" style="background:${lt.color}">${lt.code}</span>${lt.label}</div>`).join("")}
@@ -1503,8 +1592,8 @@ ${calPages>1?`
             <div class="emp-desig">${emp.designation||""}</div>
             ${emp.doj?`<div class="emp-doj">Joined: ${emp.doj}</div>`:""}
           </td>
-          <td class="bal-td">${ce?`<input type="number" class="bal-inp" value="${getEmpRemaining(emp.id,state.year).CL}" onchange="updateRemainingBalance('${emp.id}','CL',this.value)">`:`<div class="bal-view">${getEmpRemaining(emp.id,state.year).CL}</div>`}</td>
-          <td class="bal-td">${ce?`<input type="number" class="bal-inp" value="${getEmpRemaining(emp.id,state.year).SL}" onchange="updateRemainingBalance('${emp.id}','SL',this.value)">`:`<div class="bal-view">${getEmpRemaining(emp.id,state.year).SL}</div>`}</td>
+          <td class="bal-td">${(ce&&isCurMonth)?`<input type="number" class="bal-inp" value="${getRemainingForDate(emp.id,getCalendarRefDate()).CL}" onchange="updateRemainingBalance('${emp.id}','CL',this.value)">`:`<div class="bal-view">${getRemainingForDate(emp.id,getCalendarRefDate()).CL}</div>`}</td>
+          <td class="bal-td">${(ce&&isCurMonth)?`<input type="number" class="bal-inp" value="${getRemainingForDate(emp.id,getCalendarRefDate()).SL}" onchange="updateRemainingBalance('${emp.id}','SL',this.value)">`:`<div class="bal-view">${getRemainingForDate(emp.id,getCalendarRefDate()).SL}</div>`}</td>
           ${days.map(day=>{
             const key=lk(emp.id,state.year,state.month,day);
             const code=state.leaves[key]; const lt=code?LT[code]:null;
@@ -1710,7 +1799,7 @@ ${empEmps.map((emp,i)=>{
   const s=getYS(emp.id,state.year);
   const hue=(state.empPage*50+i)*53%360;
   const isOpen = state.balanceOpenId===emp.id;
-  const remain = getEmpRemaining(emp.id, state.year);
+  const remain = getRemainingForDate(emp.id, toLocalDateStr(new Date()));
   return `<div class="emp-list-item">
     <div class="emp-list-row">
     <div class="emp-avatar" style="background:hsl(${hue},40%,12%);border:1px solid hsl(${hue},60%,25%);color:hsl(${hue},80%,65%)">${emp.name.charAt(0)}</div>
@@ -1739,7 +1828,7 @@ ${empEmps.map((emp,i)=>{
     ${isOpen?`
     <div class="bal-panel">
       ${BALANCE_TYPES.map(lt=>{
-        const quota = getEmpQuota(emp.id)[lt.code]||0;
+        const quota = getEmpQuotaForDate(emp.id, toLocalDateStr(new Date()))[lt.code]||0;
         const rem = remain[lt.code];
         return `<div class="bal-cell">
           <label style="color:${lt.text}">${lt.code}</label>
@@ -1907,14 +1996,19 @@ function renderBalanceSettings(){
   const rows = state.balPasteRows||[];
   const matched = rows.filter(r=>findEmpById(r.id));
   const unmatched = rows.filter(r=>!findEmpById(r.id));
+  const snaps = sortedSnapshots();
   return `
 <div class="card" style="margin-bottom:14px;background:rgba(167,139,250,.04);border:1px solid rgba(167,139,250,.2)">
   <div style="font-size:12px;font-weight:700;color:#c4b5fd;margin-bottom:8px">🎯 Import CL / SL Balance — Excel / CSV</div>
   <div style="font-size:11px;color:#64748b;line-height:1.9">
     📊 <b style="color:#94a3b8">From Excel:</b> Select all (Ctrl+A) → Copy (Ctrl+C) → Paste below<br>
     🔑 Required columns: <span style="color:#38bdf8">ID</span>, and <span style="color:#38bdf8">SL</span> / <span style="color:#38bdf8">CL</span><br>
-    ✅ ID মিলে গেলে সেই এমপ্লয়ির CL/SL balance আপডেট হবে, বাকি সব ঠিক থাকবে
+    🗓️ প্রতিটা import একটা নতুন <b style="color:#38bdf8">"স্লট"</b> হিসেবে সেভ হবে — আগের স্লটের হিসাব হারাবে না, পুরনো তারিখে ফিরে গেলে তখনকার balance-ই দেখাবে
   </div>
+</div>
+<div class="card" style="margin-bottom:14px">
+  <div style="font-size:11px;color:#64748b;margin-bottom:8px;font-weight:600">এই নতুন balance কবে থেকে কার্যকর হবে? (Effective From)</div>
+  <input type="date" class="inp" style="max-width:220px" value="${state.balImportEffectiveFrom}" onchange="state.balImportEffectiveFrom=this.value">
 </div>
 <div class="card" style="margin-bottom:14px">
   <div style="font-size:11px;color:#64748b;margin-bottom:8px;font-weight:600">PASTE EXCEL OR CSV DATA:</div>
@@ -1922,7 +2016,7 @@ function renderBalanceSettings(){
     oninput="liveParseBalPaste(this.value)">${state.balPasteText||""}</textarea>
   <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
     <button class="btn btn-blue" onclick="parseBalPaste()">🔍 Parse & Preview</button>
-    ${rows.length>0?`<button class="btn btn-green" onclick="importBalPaste()">✅ Import ${matched.length}</button>`:""}
+    ${rows.length>0?`<button class="btn btn-green" onclick="importBalPaste()">✅ Import ${matched.length} as new slot</button>`:""}
     <button class="btn btn-gray" onclick="clearBalPaste()">Clear</button>
   </div>
 </div>
@@ -1935,10 +2029,24 @@ ${rows.length>0?`
   ${rows.slice(0,8).map(r=>{ const ok=!!findEmpById(r.id); return `<div style="font-size:11px;padding:6px 0;border-bottom:1px solid #1a2d45;display:flex;gap:10px;flex-wrap:wrap;align-items:center"><span style="color:${ok?'#38bdf8':'#f87171'};min-width:80px">${r.id}</span><span style="color:${ok?'#f1f5f9':'#94a3b8'};flex:1">${r.name||""}</span><span style="color:#94a3b8;font-size:10px">SL:${r.sl??"—"}</span><span style="color:#94a3b8;font-size:10px">CL:${r.cl??"—"}</span>${!ok?`<span style="font-size:9px;color:#f87171;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);border-radius:4px;padding:1px 5px">no match</span>`:""}</div>`; }).join("")}
   ${rows.length>8?`<div style="font-size:10px;color:#475569;margin-top:6px">...and ${rows.length-8} more</div>`:""}
 </div>`:""}
-<div class="card" style="background:rgba(56,189,248,.03)">
-  <div style="font-size:11px;font-weight:700;color:#38bdf8;margin-bottom:10px">📊 Balance Set So Far</div>
+<div class="card" style="background:rgba(56,189,248,.03);margin-bottom:14px">
+  <div style="font-size:11px;font-weight:700;color:#38bdf8;margin-bottom:10px">📊 Balance Set So Far (legacy/first slot)</div>
   <div style="font-size:20px;font-weight:900;color:#c4b5fd">${Object.keys(state.leaveBalances).length.toLocaleString()}</div>
   <div style="font-size:9px;color:#475569">EMPLOYEES WITH CUSTOM BALANCE</div>
+</div>
+<div class="card">
+  <div style="font-size:11px;font-weight:700;color:#94a3b8;margin-bottom:10px">🗓️ Import History (Slots)</div>
+  ${snaps.length===0?`<div style="font-size:11px;color:#64748b">এখনো কোনো slot import করা হয়নি — legacy balance-ই ব্যবহার হচ্ছে</div>`:
+    snaps.slice().reverse().map((s,i)=>{
+      const empCount = Object.keys(s.balances).length;
+      const isLatest = i===0;
+      return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #1a2d45">
+        <div>
+          <div style="font-size:12px;font-weight:700;color:#f1f5f9">${s.effectiveFrom} থেকে কার্যকর ${isLatest?'<span style="color:#10b981;font-size:9px">● বর্তমান</span>':''}</div>
+          <div style="font-size:10px;color:#64748b">${empCount} জন এমপ্লয়ি · imported ${new Date(s.createdAt).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'})}</div>
+        </div>
+      </div>`;
+    }).join("")}
 </div>`;
 }
 
@@ -2020,22 +2128,38 @@ window.parseBalPaste = function(){
 };
 window.importBalPaste = function(){
   if(!state.balPasteRows||!state.balPasteRows.length) return;
+  const effFrom = state.balImportEffectiveFrom || toLocalDateStr(new Date());
   let matched=0, unmatched=0;
-  const nb = {...state.leaveBalances};
+  // Start from the previous applicable balances so employees not in this week's excel keep their last-known figures
+  const prevSnap = getActiveSnapshot(effFrom);
+  const base = prevSnap ? {...prevSnap.balances} : {...state.leaveBalances};
+  const balances = {...base};
   state.balPasteRows.forEach(r=>{
     const emp = findEmpById(r.id);
     if(!emp){ unmatched++; return; }
     matched++;
-    const current = nb[emp.id] || {...DEFAULT_QUOTA};
-    nb[emp.id] = {
+    const current = balances[emp.id] || {...DEFAULT_QUOTA};
+    balances[emp.id] = {
       ...current,
       CL: r.cl!==null ? r.cl : current.CL,
       SL: r.sl!==null ? r.sl : current.SL,
     };
   });
-  state.leaveBalances = nb;
+  // If a slot already exists for this exact date, replace it; otherwise add a new one
+  const existingIdx = (state.balanceSnapshots||[]).findIndex(s=>s.effectiveFrom===effFrom);
+  const snapEntry = {
+    id: existingIdx>=0 ? state.balanceSnapshots[existingIdx].id : (Date.now()+"_"+Math.random().toString(36).slice(2,7)),
+    effectiveFrom: effFrom,
+    createdAt: Date.now(),
+    balances,
+  };
+  if(existingIdx>=0){
+    state.balanceSnapshots = state.balanceSnapshots.map((s,i)=> i===existingIdx?snapEntry:s);
+  } else {
+    state.balanceSnapshots = [...(state.balanceSnapshots||[]), snapEntry];
+  }
   debounceSave();
-  showToast(matched+" জনের balance আপডেট হয়েছে"+(unmatched>0?", "+unmatched+" ID মেলেনি":"")+" ✓");
+  showToast(matched+" জনের balance নতুন স্লট ("+effFrom+") হিসেবে সেভ হয়েছে"+(unmatched>0?", "+unmatched+" ID মেলেনি":"")+" ✓");
   state.balPasteRows = [];
   state.balPasteText = "";
   render();
